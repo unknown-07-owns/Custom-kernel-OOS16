@@ -1,83 +1,111 @@
-name: Build OnePlus Nord 4 Kernel + KernelSU-Next
+name: Build Nord 4 Kernel (boot.img)
 
 on:
   workflow_dispatch:
 
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  CC: clang
+  LLVM: 1
+  LLVM_IAS: 1
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 200
+    timeout-minutes: 240
 
     steps:
-    - name: Checkout (your repo)
+    - name: Checkout Source
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
-    - name: Clone OnePlus Kernel Source
-      run: |
-        git clone --depth=1 \
-          -b oneplus/sm7675_b_16.0.0_nord_4 \
-          https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm7675.git kernel
-
-    - name: Install build dependencies
+    - name: Install Packages
       run: |
         sudo apt update
-        sudo apt install -y \
-          bc bison flex build-essential python3 python3-pip \
-          libssl-dev libncurses5-dev libncursesw5-dev \
-          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-          ccache device-tree-compiler
+        sudo apt install -y bc bison build-essential flex git \
+        curl wget gcc-aarch64-linux-gnu clang lld llvm python3 \
+        libssl-dev libncurses5-dev device-tree-compiler lz4 zip
 
-    - name: Set build env
+    - name: Apply KernelSU NEXT
       run: |
-        echo "ARCH=arm64" >> $GITHUB_ENV
-        echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-        echo "KBUILD_BUILD_USER=GitHub" >> $GITHUB_ENV
-        echo "KBUILD_BUILD_HOST=Actions" >> $GITHUB_ENV
+        mkdir logs
+        curl -LSs https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh -o logs/kernelsu.sh
+        bash logs/kernelsu.sh | tee logs/kernelsu.log
 
-    - name: Apply KernelSU-Next patch
-      working-directory: kernel
+    - name: Kernel Config
       run: |
-        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
-        echo "KernelSU-Next patch applied!"
+        export ARCH=arm64
+        make gki_defconfig
 
-    - name: Find defconfig
-      id: defconfig
-      working-directory: kernel
+    - name: Build Kernel
       run: |
-        # Try known defconfigs
-        if ls arch/arm64/configs | grep -q "sm7675"; then
-            DEF=$(ls arch/arm64/configs | grep "sm7675" | head -n1)
-        elif ls arch/arm64/configs | grep -q "avalon"; then
-            DEF=$(ls arch/arm64/configs | grep "avalon" | head -n1)
-        else
-            echo "Could not auto-detect defconfig"
-            exit 1
+        export ARCH=arm64
+        export CC=clang
+        export LLVM=1
+        export LLVM_IAS=1
+        make -j$(nproc)
+
+    - name: Build Modules
+      run: |
+        export ARCH=arm64
+        make modules -j$(nproc) || true
+        make modules_install INSTALL_MOD_PATH=modules || true
+
+    - name: Collect Kernel Files
+      run: |
+        mkdir -p out
+        cp arch/arm64/boot/Image.lz4 out/ || true
+        cp arch/arm64/boot/Image out/ || true
+        cp arch/arm64/boot/dts/**/*.dtb out/ 2>/dev/null || true
+        cp arch/arm64/boot/dts/**/*.dtbo out/ 2>/dev/null || true
+        ls -lah out
+
+    - name: Download mkbootimg
+      run: |
+        wget https://android.googlesource.com/platform/system/tools/mkbootimg/+archive/refs/heads/master.tar.gz -O mkbootimg.tar.gz
+        mkdir mkbootimg
+        tar -xzf mkbootimg.tar.gz -C mkbootimg
+        chmod +x mkbootimg/mkbootimg.py
+
+    - name: Create boot.img
+      run: |
+        cd out
+
+        # decompress if needed
+        if [ -f Image.lz4 ]; then
+          lz4 -d Image.lz4 Image
         fi
-        echo "defconfig=$DEF" >> $GITHUB_OUTPUT
-        echo "Using defconfig: $DEF"
 
-    - name: Build kernel
-      working-directory: kernel
-      run: |
-        make O=out ${{ steps.defconfig.outputs.defconfig }}
-        make -j$(nproc) O=out
+        # find dtb
+        DTB=$(find . -name "*.dtb" | head -n 1)
+        DTBO=$(find . -name "*.dtbo" | head -n 1)
 
-    - name: Build modules
-      working-directory: kernel
-      run: |
-        make -j$(nproc) O=out modules || true
-        make O=out modules_install INSTALL_MOD_PATH=out/modules || true
+        if [ ! -f Image ]; then
+          echo "ERROR: Kernel Image not found"
+          exit 1
+        fi
 
-    - name: Package artifacts
-      run: |
-        mkdir output
-        cp -v kernel/out/arch/arm64/boot/Image output/ || true
-        cp -v kernel/out/arch/arm64/boot/dts/**/*.dtb output/ 2>/dev/null || true
-        cp -v kernel/out/arch/arm64/boot/dts/**/*.dtbo output/ 2>/dev/null || true
-        tar -C kernel/out -czf output/modules.tar.gz modules || true
+        python3 ../mkbootimg/mkbootimg.py \
+          --kernel Image \
+          ${DTB:+--dtb $DTB} \
+          ${DTBO:+--dtbo $DTBO} \
+          --output boot.img
 
-    - name: Upload kernel artifacts
+        cd ..
+
+        echo "BOOT IMAGE CREATED:"
+        ls -lah out/boot.img
+
+    - name: Upload boot.img
       uses: actions/upload-artifact@v4
       with:
-        name: nord4-kernelsu-next
-        path: output
+        name: nord4-bootimg
+        path: out/boot.img
+
+    - name: Upload Logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernelsu-log
+        path: logs/kernelsu.log
