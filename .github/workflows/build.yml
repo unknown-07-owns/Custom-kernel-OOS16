@@ -1,1 +1,83 @@
+name: Build OnePlus Nord 4 Kernel + KernelSU-Next
 
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+
+    steps:
+    - name: Checkout (your repo)
+      uses: actions/checkout@v4
+
+    - name: Clone OnePlus Kernel Source
+      run: |
+        git clone --depth=1 \
+          -b oneplus/sm7675_b_16.0.0_nord_4 \
+          https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm7675.git kernel
+
+    - name: Install build dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          bc bison flex build-essential python3 python3-pip \
+          libssl-dev libncurses5-dev libncursesw5-dev \
+          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+          ccache device-tree-compiler
+
+    - name: Set build env
+      run: |
+        echo "ARCH=arm64" >> $GITHUB_ENV
+        echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+        echo "KBUILD_BUILD_USER=GitHub" >> $GITHUB_ENV
+        echo "KBUILD_BUILD_HOST=Actions" >> $GITHUB_ENV
+
+    - name: Apply KernelSU-Next patch
+      working-directory: kernel
+      run: |
+        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+        echo "KernelSU-Next patch applied!"
+
+    - name: Find defconfig
+      id: defconfig
+      working-directory: kernel
+      run: |
+        # Try known defconfigs
+        if ls arch/arm64/configs | grep -q "sm7675"; then
+            DEF=$(ls arch/arm64/configs | grep "sm7675" | head -n1)
+        elif ls arch/arm64/configs | grep -q "avalon"; then
+            DEF=$(ls arch/arm64/configs | grep "avalon" | head -n1)
+        else
+            echo "Could not auto-detect defconfig"
+            exit 1
+        fi
+        echo "defconfig=$DEF" >> $GITHUB_OUTPUT
+        echo "Using defconfig: $DEF"
+
+    - name: Build kernel
+      working-directory: kernel
+      run: |
+        make O=out ${{ steps.defconfig.outputs.defconfig }}
+        make -j$(nproc) O=out
+
+    - name: Build modules
+      working-directory: kernel
+      run: |
+        make -j$(nproc) O=out modules || true
+        make O=out modules_install INSTALL_MOD_PATH=out/modules || true
+
+    - name: Package artifacts
+      run: |
+        mkdir output
+        cp -v kernel/out/arch/arm64/boot/Image output/ || true
+        cp -v kernel/out/arch/arm64/boot/dts/**/*.dtb output/ 2>/dev/null || true
+        cp -v kernel/out/arch/arm64/boot/dts/**/*.dtbo output/ 2>/dev/null || true
+        tar -C kernel/out -czf output/modules.tar.gz modules || true
+
+    - name: Upload kernel artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: nord4-kernelsu-next
+        path: output
